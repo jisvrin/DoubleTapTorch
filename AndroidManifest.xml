@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.jcy.doubletorch"
+    android:versionCode="1"
+    android:versionName="1.0">
+    <application
+        android:label="双击手电筒"
+        android:hasCode="true">
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription" android:value="双击电源键开关手电筒（替代卡包）" />
+        <meta-data android:name="xposedminversion" android:value="93" />
+        <meta-data android:name="xposedscope" android:resource="@array/xposedscope" />
+    </application>
+</manifest>

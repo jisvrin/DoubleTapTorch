@@ -1,0 +1,24 @@
+# 构建产物
+out/
+build/
+*.apk
+*.aab
+
+# 签名文件（绝对不要提交）
+*.keystore
+*.jks
+*.p12
+key.properties
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak
