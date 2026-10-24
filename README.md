@@ -27,7 +27,7 @@ ColorOS 用的是自己的一套实现，落在 `PhoneWindowManager.interceptPow
 
 ## 已知限制
 
-- 只在 **ColorOS 16 / Android 17 / 一加 13T（PJZ110）** 上实测通过，其它 ROM 未验证
+- 只在 **ColorOS 16 / Android 17 / 一加 13（PJZ110）** 上实测通过，其它 ROM 未验证
 - 息屏状态下双击开灯时，**第一次按下仍会短暂点亮屏幕**（因为本方案不拦截按下事件）。要消掉这个必须改成「延迟单击」，代价是每次单击都延迟，本项目没有采用
 - 手电筒亮度受 `CameraManager` 强度档位限制：本机 `FLASH_INFO_STRENGTH_MAXIMUM_LEVEL = 4`，最高档对应 `sysfs` 值 50，达不到节点上限 500。要 500 需要 root 直接写 `/sys/class/leds/led:torch_0/brightness`，本项目没有内置
 
