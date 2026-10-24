@@ -38,7 +38,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "[DoubleTapTorch] ";
-    private static final long DOUBLE_GAP_MS = 501L;
+    private static final long DOUBLE_GAP_MS = 500L;
 
     private static volatile long sLastDown;
     private static volatile int sSeq;
