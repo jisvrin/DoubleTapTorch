@@ -21,6 +21,7 @@ ColorOS 使用自己的实现，落在 `PhoneWindowManager.interceptPowerKeyDown
 ## 功能
 
 - **双击电源键** → 开关手电筒（卡包不再弹出）
+- **开 / 关手电筒时** → 灵动岛显示当前状态
 - **单击电源键** → 完全交给系统，零延迟（灭屏 / 亮屏均为原生速度）
 - **长按电源键** → 完全交给系统，电源菜单正常
 - **灭屏后立刻再按** → 屏幕亮起，灯不亮、卡包不弹（v1.1.0 起）
@@ -63,7 +64,7 @@ A 亮 && B 灭  →  第一下已执行过灭屏，此序列属于"亮屏"
 1. 设备已 root 并安装 LSPosed（Zygisk 版本）
 2. 安装 `DoubleTapTorch.apk`
 3. LSPosed → 模块 → 启用 `DoubleTapTorch`
-4. 作用域仅勾选 **系统框架**（`android`）
+4. 作用域勾选 **系统框架**（`android`）和 **系统界面**（`com.android.systemui`），两个都要
 5. 重启
 
 ## 调整双击窗口

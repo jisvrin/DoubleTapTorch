@@ -92,7 +92,7 @@ def build():
     S_PREFIX = p.add('android')
     S_URI = p.add('http://schemas.android.com/apk/res/android')
     S_PKG = p.add('com.jcy.doubletorch')
-    S_VER = p.add('1.2.0')
+    S_VER = p.add('1.3.0')
     S_LABEL = p.add('DoubleTapTorch')
     S_TRUE = p.add('true')
     S_MINVER = p.add('93')
@@ -110,7 +110,7 @@ def build():
     # <manifest package=... android:versionCode=1 android:versionName="1.0">
     body += start_element(NONE, S_MANIFEST, [
         (NONE, S_PACKAGE, S_PKG, TYPE_STRING, S_PKG),
-        (U, A_VERSION_CODE, NONE, TYPE_INT_DEC, 120),
+        (U, A_VERSION_CODE, NONE, TYPE_INT_DEC, 130),
         (U, A_VERSION_NAME, S_VER, TYPE_STRING, S_VER),
     ])
     # <application android:label="DoubleTapTorch" android:hasCode=true>

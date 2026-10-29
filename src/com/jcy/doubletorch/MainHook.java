@@ -1,6 +1,9 @@
 package com.jcy.doubletorch;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.os.Binder;
@@ -8,8 +11,8 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.PowerManager;
 import android.os.SystemClock;
-import java.lang.reflect.Method;
 
+import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -22,29 +25,26 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * 双击电源键 -> 手电筒（替代 ColorOS 的双击卡包）。
  *
- * 排查记录：
- *  v1 hook PhoneWindowManager$PowerKeyRule#onMultiPress  -> 从未被调用
- *  v2 追加 GestureLauncherService 全套 + interceptKeyBeforeQueueing
- *     -> 只有 [PWM] POWER 出现，PowerKeyRule / GLS 全部沉默
- *     即 ColorOS 在 PhoneWindowManager 内部用自己的 IInputExt 处理电源键，
- *     卡包在 "电源键抬起" 时进入（system_server 里有方法名 handlePowerKeyUpForWallet）。
+ * v6 起：手电筒不再由 system_server 直接调 CameraManager，改为发广播给 SystemUI，
+ * 由 SystemUI 的 FlashlightController#setFlashlightFromUser() 开启，
+ * 这样才会触发系统的「手电筒已开启」提示（灵动岛 / 状态通知）。
  *
- * v3 因此直接挂 PhoneWindowManager 真正的电源键处理入口：
- *   interceptPowerKeyDown(KeyEvent, boolean, boolean)   void  只观测，记录按下序列
- *   interceptPowerKeyUp(KeyEvent, boolean)              void  双击的第二下抬起时，
- *                                                            吃掉手势（卡包不弹）并开关手电筒
- * 单击不干预，走系统原逻辑。
+ * 两个进程各司其职：
+ *   system_server：判定双击 / 亮屏，发广播
+ *   SystemUI    ：捕获 FlashlightControllerImpl 实例，收到广播后调用它
  */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "[DoubleTapTorch] ";
+    private static final String TORCH_ACTION = "com.jcy.doubletorch.action.SET_TORCH";
     private static final long DOUBLE_GAP_MS = 500L;
+    /** 开机后这段时间内不走广播（SystemUI 尚未就绪），直接控制灯。 */
+    private static final long BOOT_GRACE_MS = 10000L;
 
+    // ---------- system_server 侧 ----------
     private static volatile long sLastDown;
     private static volatile int sSeq;
-    /** 本次双击序列第一下按下时，屏幕是否亮着。 */
     private static volatile boolean sFirstInteractive = true;
-    /** 本次按下要改造成"亮屏"（灭屏后又立刻按的情况）。 */
     private static volatile boolean sPendingWake;
 
     private static CameraManager sCamera;
@@ -53,11 +53,89 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean sInit;
     private static final Map<String, Boolean> sState = new ConcurrentHashMap<String, Boolean>();
 
+    /** 最近一次下发的开灯命令，用于抵消异步延迟导致的连按误判。 */
+    private static volatile Boolean sLastCmd;
+    private static volatile long sLastCmdAt;
+
+    // ---------- SystemUI 侧 ----------
+    private static volatile Object sTorchCtrl;
+
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+        if ("com.android.systemui".equals(lpparam.packageName)) {
+            hookSystemUI(lpparam);
+            return;
+        }
         if (!"android".equals(lpparam.packageName)) return;
         XposedBridge.log(TAG + "attached: process=" + lpparam.processName);
+        hookPowerKey(lpparam);
+    }
 
+    // ==================== SystemUI 侧 ====================
+    private void hookSystemUI(XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            Class<?> flc = XposedHelpers.findClass(
+                    "com.android.systemui.statusbar.policy.FlashlightControllerImpl",
+                    lpparam.classLoader);
+            XposedBridge.hookAllConstructors(flc, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    sTorchCtrl = param.thisObject;
+                    XposedBridge.log(TAG + "[SUI] controller captured");
+                }
+            });
+            XposedBridge.log(TAG + "[SUI] constructor hooked");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "[SUI] controller hook failed: " + t);
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod("android.app.Application", lpparam.classLoader,
+                    "onCreate", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                registerReceiver((Context) param.thisObject);
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "[SUI] register failed: " + t);
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "[SUI] application hook failed: " + t);
+        }
+    }
+
+    private static void registerReceiver(Context ctx) {
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent intent) {
+                boolean enable = intent.getBooleanExtra("enable", false);
+                Object ctrl = sTorchCtrl;
+                XposedBridge.log(TAG + "[SUI] cmd enable=" + enable + " ctrl=" + ctrl);
+                if (ctrl == null) return;
+                long token = Binder.clearCallingIdentity();
+                try {
+                    XposedHelpers.callMethod(ctrl, "setFlashlightFromUser", enable);
+                    XposedBridge.log(TAG + "[SUI] setFlashlightFromUser(" + enable + ") ok");
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + "[SUI] call failed: " + t);
+                } finally {
+                    Binder.restoreCallingIdentity(token);
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter(TORCH_ACTION);
+        try {
+            ctx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+        } catch (Throwable t) {
+            ctx.registerReceiver(receiver, filter);
+        }
+        XposedBridge.log(TAG + "[SUI] receiver registered");
+    }
+
+    // ==================== system_server 侧 ====================
+    private void hookPowerKey(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
             Class<?> pwm = XposedHelpers.findClass(
                     "com.android.server.policy.PhoneWindowManager", lpparam.classLoader);
@@ -72,8 +150,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (seq == 1) {
                         sFirstInteractive = interactive;
                     } else if (sFirstInteractive && !interactive) {
-                        // 第一下亮着、这一下灭了：用户想要的是"亮屏"，不是手电筒。
-                        // 交给 UP 处理：吃掉这次手势并自己唤醒屏幕。
                         XposedBridge.log(TAG + "[PWM] screen went off -> plan wake-up");
                         seq = 1;
                         sPendingWake = true;
@@ -84,7 +160,6 @@ public class MainHook implements IXposedHookLoadPackage {
                             + " interactive=" + interactive);
                 }
             });
-            XposedBridge.log(TAG + "hook interceptPowerKeyDown OK");
 
             XposedBridge.hookAllMethods(pwm, "interceptPowerKeyUp", new XC_MethodHook() {
                 @Override
@@ -94,27 +169,26 @@ public class MainHook implements IXposedHookLoadPackage {
                     sPendingWake = false;
                     XposedBridge.log(TAG + "[PWM] UP seq=" + seq + " pendingWake=" + pendingWake);
                     Context ctx = context(param.thisObject);
-                    if (ctx == null) {
-                        XposedBridge.log(TAG + "no context");
-                        return;
-                    }
+                    if (ctx == null) return;
+
                     if (pendingWake) {
                         wakeUp(ctx);
                         param.setResult(null);
                         sSeq = 0;
                         sLastDown = 0;
-                        XposedBridge.log(TAG + "wake-up consumed (screen back on)");
+                        XposedBridge.log(TAG + "wake-up consumed");
                         return;
                     }
                     if (seq != 2) return;
-                    toggle(ctx);
+
+                    toggleTorch(ctx);
                     param.setResult(null);
                     sSeq = 0;
                     sLastDown = 0;
-                    XposedBridge.log(TAG + "double press consumed -> torch");
+                    XposedBridge.log(TAG + "double press consumed");
                 }
             });
-            XposedBridge.log(TAG + "hook interceptPowerKeyUp OK");
+            XposedBridge.log(TAG + "power key hooks installed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "hook failed: " + t);
         }
@@ -155,33 +229,55 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }, sBg);
             sInit = true;
-            XposedBridge.log(TAG + "torch controller ready");
+            XposedBridge.log(TAG + "torch tracker ready");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "init failed: " + t);
         }
     }
 
-    private static void toggle(final Context ctx) {
+    private static void toggleTorch(final Context ctx) {
         ensureInit(ctx);
         final Handler bg = sBg;
-        if (bg == null || sCamera == null) return;
+        if (bg == null) return;
         bg.post(new Runnable() {
             @Override
             public void run() {
                 try {
                     String id = flashId();
                     if (id == null) {
-                        XposedBridge.log(TAG + "no camera with flash");
+                        XposedBridge.log(TAG + "no flash unit");
                         return;
                     }
+                    long now = SystemClock.uptimeMillis();
+                    boolean target;
                     Boolean cur = sState.get(id);
-                    boolean target = !(cur != null && cur);
+                    Boolean last = sLastCmd;
+                    if (last != null && now - sLastCmdAt < 1500L) {
+                        target = !last;
+                    } else {
+                        target = !(cur != null && cur);
+                    }
+                    sLastCmd = target;
+                    sLastCmdAt = now;
+
+                    // 开机初期 SystemUI 还没起来，广播必然落空：
+                    // 这段时间直接控制灯，双击照样能用，只是没有灵动岛提示。
+                    if (SystemClock.elapsedRealtime() < BOOT_GRACE_MS) {
+                        sCamera.setTorchMode(id, target);
+                        XposedBridge.log(TAG + "boot grace -> torch=" + target);
+                        return;
+                    }
+
+                    Intent intent = new Intent(TORCH_ACTION);
+                    intent.putExtra("enable", target);
+                    intent.setPackage("com.android.systemui");
                     long token = Binder.clearCallingIdentity();
                     try {
-                        setTorch(id, target);
+                        ctx.sendBroadcast(intent);
                     } finally {
                         Binder.restoreCallingIdentity(token);
                     }
+                    XposedBridge.log(TAG + "broadcast sent enable=" + target);
                 } catch (Throwable t) {
                     XposedBridge.log(TAG + "toggle failed: " + t);
                 }
@@ -189,50 +285,30 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-
-    // ---------------- 亮度 ----------------
-    private static int sStrengthMax = -2;
-
-    private static void setTorch(String id, boolean on) {
+    private static String flashId() {
+        if (sFlashId != null) return sFlashId;
+        long token = Binder.clearCallingIdentity();
         try {
-            if (!on) {
-                sCamera.setTorchMode(id, false);
-                XposedBridge.log(TAG + "torch off");
-                return;
-            }
-            int level = strengthLevel(id);
-            if (level > 0) {
-                try {
-                    java.lang.reflect.Method m = CameraManager.class.getMethod(
-                            "turnOnTorchWithStrengthLevel", String.class, int.class);
-                    m.invoke(sCamera, id, level);
-                    XposedBridge.log(TAG + "torch on strength=" + level);
-                    return;
-                } catch (Throwable t) {
-                    XposedBridge.log(TAG + "strength api failed: " + t);
-                }
-            }
-            sCamera.setTorchMode(id, true);
-            XposedBridge.log(TAG + "torch on default(32)");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "setTorch failed: " + t);
-        }
-    }
-
-    private static int strengthLevel(String id) {
-        if (sStrengthMax == -2) {
-            sStrengthMax = -1;
-            try {
+            String fallback = null;
+            for (String id : sCamera.getCameraIdList()) {
                 CameraCharacteristics c = sCamera.getCameraCharacteristics(id);
-                Integer v = c.get(CameraCharacteristics.FLASH_INFO_STRENGTH_MAXIMUM_LEVEL);
-                if (v != null) sStrengthMax = v;
-                XposedBridge.log(TAG + "strength max=" + sStrengthMax);
-            } catch (Throwable t) {
-                XposedBridge.log(TAG + "strength probe failed: " + t);
+                Boolean flash = c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+                if (flash == null || !flash) continue;
+                Integer facing = c.get(CameraCharacteristics.LENS_FACING);
+                if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    sFlashId = id;
+                    return id;
+                }
+                if (fallback == null) fallback = id;
             }
+            sFlashId = fallback;
+            return fallback;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "flashId failed: " + t);
+            return null;
+        } finally {
+            Binder.restoreCallingIdentity(token);
         }
-        if (sStrengthMax <= 0) return -1;
-        return Math.min(500, sStrengthMax);
     }
 
     // ---------------- 亮屏 ----------------
@@ -251,13 +327,13 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedBridge.log(TAG + "wakeUp probe -> " + m);
             }
             if (m == null) {
-                XposedBridge.log(TAG + "no wakeUp method available");
+                XposedBridge.log(TAG + "no wakeUp method");
                 return;
             }
             long token = Binder.clearCallingIdentity();
             try {
                 m.invoke(pm, buildArgs(m, SystemClock.uptimeMillis()));
-                XposedBridge.log(TAG + "wakeUp sent, argc=" + m.getParameterTypes().length);
+                XposedBridge.log(TAG + "wakeUp sent");
             } finally {
                 Binder.restoreCallingIdentity(token);
             }
@@ -294,31 +370,5 @@ public class MainHook implements IXposedHookLoadPackage {
             else a[i] = null;
         }
         return a;
-    }
-
-    private static String flashId() {
-        if (sFlashId != null) return sFlashId;
-        long token = Binder.clearCallingIdentity();
-        try {
-            String fallback = null;
-            for (String id : sCamera.getCameraIdList()) {
-                CameraCharacteristics c = sCamera.getCameraCharacteristics(id);
-                Boolean flash = c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
-                if (flash == null || !flash) continue;
-                Integer facing = c.get(CameraCharacteristics.LENS_FACING);
-                if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
-                    sFlashId = id;
-                    return id;
-                }
-                if (fallback == null) fallback = id;
-            }
-            sFlashId = fallback;
-            return fallback;
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "flashId failed: " + t);
-            return null;
-        } finally {
-            Binder.restoreCallingIdentity(token);
-        }
     }
 }
